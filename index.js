@@ -37,7 +37,7 @@ if (process.env.GOOGLE_CREDENTIALS) {
 }
 
 // ==========================================
-// API 1: CREATE ORDER (Data Save First)
+// API 1: CREATE ORDER (Modified for Speed & Random ID)
 // ==========================================
 app.post('/create-order', async (req, res) => {
     try {
@@ -53,31 +53,27 @@ app.post('/create-order', async (req, res) => {
             size = parts[1].replace(")", "").trim();
         }
 
-        // 2. Google Sheet में 'Pending' Data सेव करें (ताकि Address सुरक्षित रहे)
+        // 2. Google Sheet में 'Pending' Data सेव करें
+        // Note: Ab yeh function pehle sheet READ nahi karega, seedha random ID banakar WRITE karega
         const sheetId = await savePendingOrderToSheet(data, fixedProductName, size);
 
-        // 3. Random Receipt ID जनरेट करें (ताकि कस्टमर को असली ID न दिखे)
-        const randomReceipt = "ord_" + crypto.randomBytes(4).toString('hex');
+        // 3. Razorpay ke liye ek alag Receipt ID (Internal use)
+        const randomReceipt = "rcpt_" + crypto.randomBytes(4).toString('hex');
 
-        // 4. Razorpay Order (सिर्फ जरूरी डेटा भेजें)
+        // 4. Razorpay Order Create
         const options = {
             amount: amountInPaise,
             currency: "INR",
-            receipt: randomReceipt, // Random ID
+            receipt: randomReceipt,
             payment_capture: 1,
-            
-            // NOTES: अब यहाँ सिर्फ वही डेटा है जो आप चाहते हैं
             notes: {
-                sheet_id: sheetId,           // ट्रैकिंग के लिए (यह जरूरी है)
+                sheet_id: sheetId,           // Tracking ID (Important)
                 product_name: fixedProductName,
                 customer_name: data.customer_details.customer_name
-                // Address/Phone यहाँ से हटा दिया गया है
             }
         };
 
         const order = await razorpay.orders.create(options);
-
-        // Sheet में Razorpay Order ID अपडेट करें (Optional step, skipping for speed)
 
         res.json({
             status: 'OK',
@@ -85,7 +81,7 @@ app.post('/create-order', async (req, res) => {
             amount: amountInPaise,
             key_id: process.env.RAZORPAY_KEY_ID,
             product_name: fixedProductName,
-            custom_id: sheetId // Frontend tracking ke liye
+            custom_id: sheetId // Frontend tracking ke liye random ID return kar rahe hain
         });
 
     } catch (error) {
@@ -112,12 +108,12 @@ app.post('/razorpay-webhook', async (req, res) => {
             const paymentEntity = req.body.payload.payment.entity;
             const notes = paymentEntity.notes;
 
-            // Sheet ID नोट से निकालें
+            // Sheet ID note se nikalen
             const customSheetId = notes.sheet_id; 
 
             if (customSheetId) {
                 try {
-                    // Sheet में Status Update करें
+                    // Sheet me Status Update karein
                     await updateSheetStatus(customSheetId, paymentEntity.id);
                     res.status(200).json({ status: 'ok' });
                 } catch (err) {
@@ -140,24 +136,25 @@ app.post('/razorpay-webhook', async (req, res) => {
 // HELPER FUNCTIONS
 // ==========================================
 
-// Function 1: Payment से पहले डेटा सेव करना (Pending)
+// Function 1: Generate Random ID (New Logic)
+function generateCustomId() {
+    // Generate SPL + 8 random hex characters (e.g., SPL4F2A9B)
+    const randomPart = crypto.randomBytes(4).toString('hex').toUpperCase();
+    return "SPL" + randomPart;
+}
+
+// Function 2: Save Pending Order (Optimized - No Read, Only Write)
 async function savePendingOrderToSheet(data, product, size) {
     const client = await auth.getClient();
     const googleSheets = google.sheets({ version: 'v4', auth: client });
 
-    // Last ID निकालें
-    const getRows = await googleSheets.spreadsheets.values.get({
-        spreadsheetId: SPREADSHEET_ID,
-        range: SHEET_NAME + '!B:B', // सिर्फ B Column (IDs) लाएं
-    });
-    
-    const rows = getRows.data.values || [];
-    const newCustomId = generateCustomId(rows); // SPL326...
+    // Generate Random ID immediately
+    const newCustomId = generateCustomId(); 
     const isoDate = new Date().toISOString();
 
     const newRow = [
         isoDate,                              // [0] Date
-        newCustomId,                          // [1] Custom ID
+        newCustomId,                          // [1] Custom ID (Random)
         "Generating...",                      // [2] Rzp Order ID (Initially Empty)
         data.customer_details.customer_name,  // [3] Name
         String(data.customer_details.customer_phone), // [4] Phone
@@ -172,7 +169,7 @@ async function savePendingOrderToSheet(data, product, size) {
         data.amount_paid,                     // [13] Paid
         data.amount_remaining,                // [14] Remaining
         data.total_amount,                    // [15] Total
-        "Pending Payment"                     // [16] Status (शुरुआत में Pending)
+        "Pending Payment"                     // [16] Status (Pending)
     ];
 
     await googleSheets.spreadsheets.values.append({
@@ -186,12 +183,12 @@ async function savePendingOrderToSheet(data, product, size) {
     return newCustomId;
 }
 
-// Function 2: Payment के बाद Status Update करना
+// Function 3: Update Status After Payment
 async function updateSheetStatus(targetId, rzpPaymentId) {
     const client = await auth.getClient();
     const googleSheets = google.sheets({ version: 'v4', auth: client });
 
-    // 1. सारे IDs लाओ ताकि पता चले कौन सी Row में अपडेट करना है
+    // 1. Column B (IDs) laayein taaki row number mil sake
     const getIds = await googleSheets.spreadsheets.values.get({
         spreadsheetId: SPREADSHEET_ID,
         range: SHEET_NAME + '!B:B', // Column B contains Custom IDs
@@ -200,9 +197,10 @@ async function updateSheetStatus(targetId, rzpPaymentId) {
     const rows = getIds.data.values;
     let rowIndex = -1;
 
-    // Row ढूंढे
+    // Row search karein
     if (rows && rows.length) {
         for (let i = 0; i < rows.length; i++) {
+            // Check match (targetId jo webhook se aaya vs Sheet ID)
             if (rows[i][0] === targetId) {
                 rowIndex = i + 1; // Sheet row index (1-based)
                 break;
@@ -211,10 +209,6 @@ async function updateSheetStatus(targetId, rzpPaymentId) {
     }
 
     if (rowIndex !== -1) {
-        //  
-        // Status Column Q (17th column) में "Payment Received" लिखें
-        // Rzp ID Column C (3rd column) में Payment ID लिखें
-        
         // Update Razorpay ID (Column C)
         await googleSheets.spreadsheets.values.update({
             spreadsheetId: SPREADSHEET_ID,
@@ -235,32 +229,6 @@ async function updateSheetStatus(targetId, rzpPaymentId) {
     } else {
         console.log(`ID ${targetId} not found in sheet.`);
     }
-}
-
-// ID Logic: SPL325 -> SPL326
-function generateCustomId(rows) {
-    const ID_PREFIX = "SPL";
-    const START_BATCH = 351;
-    let currentBatch = START_BATCH;
-    let currentSequence = 1;
-
-    if (rows.length > 1) {
-        // rows ab sirf Column B hai, isliye rows[last][0] use karein
-        const lastId = rows[rows.length - 1][0]; 
-        
-        if (lastId && lastId.startsWith(ID_PREFIX)) {
-            const match = lastId.match(/^SPL(\d{3})(\d{3})$/);
-            if (match) {
-                currentBatch = parseInt(match[1]);
-                currentSequence = parseInt(match[2]) + 1;
-                if (currentSequence > 999) {
-                    currentBatch++;
-                    currentSequence = 1;
-                }
-            }
-        }
-    }
-    return ID_PREFIX + currentBatch + ("000" + currentSequence).slice(-3);
 }
 
 app.listen(PORT, () => {
